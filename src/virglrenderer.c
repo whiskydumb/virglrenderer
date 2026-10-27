@@ -41,6 +41,7 @@
 #include "util/u_format.h"
 #include "util/u_math.h"
 #include "vkr_allocator.h"
+#include "virgl_os.h"
 #include "drm_renderer.h"
 #include "proxy/proxy_renderer.h"
 #include "vrend/vrend_renderer.h"
@@ -1262,8 +1263,14 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
 
       switch (export_fd_type) {
       case VIRGL_RESOURCE_FD_DMABUF:
-      case VIRGL_RESOURCE_FD_SHM:
          map = mmap(NULL, res->map_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+         map_size = res->map_size;
+         break;
+      case VIRGL_RESOURCE_FD_SHM:
+         map = virgl_os_shm_map(fd, res->map_size);
+         /* the VMM hands this mapping to its guest */
+         if (map)
+            virgl_os_shm_prefault_write(map, res->map_size);
          map_size = res->map_size;
          break;
       case VIRGL_RESOURCE_FD_OPAQUE:
@@ -1281,7 +1288,7 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
       }
 
       if (export_fd_type != fd_type)
-         close(fd);
+         virgl_os_handle_close(fd);
    }
 
    if (!map || map == MAP_FAILED)
@@ -1359,8 +1366,10 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
       ret = vrend_renderer_resource_unmap(res->pipe_resource);
    } else {
       switch (res->fd_type) {
-      case VIRGL_RESOURCE_FD_DMABUF:
       case VIRGL_RESOURCE_FD_SHM:
+         virgl_os_shm_unmap(res->mapped, res->map_size);
+         break;
+      case VIRGL_RESOURCE_FD_DMABUF:
       case VIRGL_RESOURCE_OPAQUE_HANDLE:
          ret = munmap(res->mapped, res->map_size);
          break;

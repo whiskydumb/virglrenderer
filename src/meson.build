@@ -27,6 +27,7 @@ subdir('gallium')
 virgl_sources = [
    'virgl_context.c',
    'virgl_fence.c',
+   'virgl_os.c',
    'virgl_resource.c',
    'virgl_util.c',
 ]

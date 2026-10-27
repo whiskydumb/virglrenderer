@@ -35,6 +35,7 @@
 #include "util/u_pointer.h"
 #include "virgl_util.h"
 #include "virgl_context.h"
+#include "virgl_os.h"
 
 static struct util_hash_table *virgl_resource_table;
 static struct virgl_resource_pipe_callbacks pipe_callbacks;
@@ -48,7 +49,7 @@ virgl_resource_destroy_func(void *val)
       pipe_callbacks.unref(res->pipe_resource, pipe_callbacks.data);
    if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
        (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
-      close(res->fd);
+      virgl_os_handle_close(res->fd);
 
    free(res);
 }
@@ -144,7 +145,7 @@ virgl_resource_create_from_fd(uint32_t res_id,
 
    res = virgl_resource_create(res_id);
    if (!res) {
-      close(fd);
+      virgl_os_handle_close(fd);
       return NULL;
    }
 
@@ -264,7 +265,7 @@ virgl_resource_export_fd(struct virgl_resource *res, int *fd)
 
       return ctx->export_opaque_handle(ctx, res, fd);
    } else if (res->fd_type != VIRGL_RESOURCE_FD_INVALID) {
-      *fd = os_dupfd_cloexec(res->fd);
+      *fd = virgl_os_handle_dup(res->fd);
       return *fd >= 0 ? res->fd_type : VIRGL_RESOURCE_FD_INVALID;
    } else if (res->pipe_resource) {
       return pipe_callbacks.export_fd(res->pipe_resource,
