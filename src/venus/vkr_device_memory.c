@@ -403,6 +403,12 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          export_info = NULL;
       }
 
+      /* host-pointer imports cannot be dedicated (VUID-VkMemoryAllocateInfo-pNext-02806) */
+      VkBaseInStructure *prev_of_dedicated_info =
+         vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+      if (prev_of_dedicated_info)
+         prev_of_dedicated_info->pNext = prev_of_dedicated_info->pNext->pNext;
+
       args->ret = vkr_shm_get_import_info(dev, alloc_info, &shm, &local_host_import_info);
       if (args->ret != VK_SUCCESS)
          return;
