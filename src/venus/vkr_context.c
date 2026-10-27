@@ -704,7 +704,10 @@ vkr_context_create(uint32_t ctx_id,
    if (VKR_DEBUG(VALIDATE))
       ctx->validate_level = VKR_CONTEXT_VALIDATE_FULL;
 
-#ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
+/* A forked worker leaves cleanup to process exit; contexts that share a long-lived
+ * process (worker threads, or the VMM itself for src/local) must clean up for real.
+ */
+#if defined(ENABLE_RENDER_SERVER_WORKER_THREAD) || defined(ENABLE_LOCAL_VENUS)
    ctx->on_worker_thread = true;
 #else
    ctx->on_worker_thread = false;
