@@ -356,12 +356,13 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
          vkr_log("vkDeviceWaitIdle(%p) failed(%d)", dev, (int32_t)result);
    }
 
-   mtx_destroy(&dev->object_mutex);
-
+   /* removing each object takes object_mutex, so destroy the mutex afterwards */
    if (!list_is_empty(&dev->objects)) {
       list_for_each_entry_safe (struct vkr_object, obj, &dev->objects, track_head)
          vkr_device_object_destroy(ctx, dev, obj);
    }
+
+   mtx_destroy(&dev->object_mutex);
 
    list_for_each_entry_safe (struct vkr_queue, queue, &dev->queues, base.track_head)
       vkr_queue_destroy(ctx, queue);
