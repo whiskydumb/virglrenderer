@@ -346,7 +346,10 @@ if with_check_gl_errors
 endif
 
 with_venus = get_option('venus')
-with_render_server = with_venus
+# Windows has no fork() or SCM_RIGHTS, so venus runs in the VMM process there
+# (src/local) until the render server is ported.
+with_render_server = with_venus and not with_host_windows
+with_local_venus = with_venus and not with_render_server
 with_render_server_worker = get_option('render-server-worker')
 render_server_install_dir = get_option('prefix') / get_option('libexecdir')
 if with_venus
@@ -357,6 +360,14 @@ if with_venus
       venus_dep = dependency('vulkan')
    endif
 
+   conf_data.set('ENABLE_VENUS', 1)
+endif
+
+if with_local_venus
+   conf_data.set('ENABLE_LOCAL_VENUS', 1)
+endif
+
+if with_render_server
    if host_machine.system() in ['freebsd', 'openbsd']
       # When building for FreeBSD, epoll(7) is provided by a userspace
       # wrapper around kqueue(2).
@@ -365,7 +376,6 @@ if with_venus
       epoll_dep = []
    endif
 
-   conf_data.set('ENABLE_VENUS', 1)
    conf_data.set('ENABLE_RENDER_SERVER', 1)
    conf_data.set('RENDER_SERVER_EXEC_PATH',
                  '"' + render_server_install_dir / 'virgl_render_server' + '"')
@@ -457,6 +467,7 @@ summary({'c_args': (' ').join(get_option('c_args')),
         'drm-panfrost': with_drm_panfrost,
         'drm-msm': with_drm_msm,
         'render server worker': with_render_server ? with_render_server_worker : 'none',
+        'local venus': with_local_venus,
         'video': with_video,
         'tests': with_tests,
         'fuzzer': with_fuzzer,

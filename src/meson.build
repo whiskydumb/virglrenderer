@@ -154,6 +154,10 @@ proxy_sources = [
    'proxy/proxy_socket.c',
 ]
 
+local_sources = [
+   'local/local_renderer.c',
+]
+
 video_sources = [
    'vrend/virgl_video.c',
    'vrend/vrend_video.c',
@@ -229,6 +233,10 @@ endif
 
 if with_render_server
    virgl_sources += proxy_sources
+endif
+
+if with_local_venus
+   virgl_sources += local_sources
 endif
 
 if with_video

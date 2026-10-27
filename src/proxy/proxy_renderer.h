@@ -36,6 +36,46 @@ proxy_context_create(uint32_t ctx_id,
                      size_t debug_len,
                      const char *debug_name);
 
+#elif defined(ENABLE_LOCAL_VENUS)
+
+/* Without a render server, VIRGL_RENDERER_RENDER_SERVER runs venus in the VMM
+ * process instead (src/local), so VMMs need no changes.
+ */
+#include "local/local_renderer.h"
+
+static inline int
+proxy_renderer_init(UNUSED const struct proxy_renderer_cbs *cbs, uint32_t flags)
+{
+   return local_renderer_init(flags);
+}
+
+static inline void
+proxy_renderer_fini(void)
+{
+   local_renderer_fini();
+}
+
+static inline void
+proxy_renderer_reset(void)
+{
+   local_renderer_reset();
+}
+
+static inline size_t
+proxy_get_capset(uint32_t set, void *caps)
+{
+   return local_get_capset(set, caps);
+}
+
+static inline struct virgl_context *
+proxy_context_create(uint32_t ctx_id,
+                     uint32_t ctx_flags,
+                     size_t debug_len,
+                     const char *debug_name)
+{
+   return local_context_create(ctx_id, ctx_flags, debug_len, debug_name);
+}
+
 #else /* ENABLE_RENDER_SERVER */
 
 static inline int
