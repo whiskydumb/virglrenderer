@@ -422,10 +422,61 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
    mtx_unlock(&queue->vk_mutex);
 }
 
+/* Drops the export info for an emulated sync_fd handle type before the
+ * create info reaches a driver that has no such handle type.
+ */
+static void
+vkr_strip_emulated_export_info(const struct vkr_device *dev,
+                               const void *create_info,
+                               VkStructureType export_type)
+{
+   if (!dev->physical_device->emulate_sync_fd)
+      return;
+
+   VkBaseOutStructure *prev = vkr_find_prev_struct(create_info, export_type);
+   if (prev)
+      prev->pNext = prev->pNext->pNext;
+}
+
+/* Stands in for a sync_fd import or export on hosts that emulate them: an
+ * empty submission that signals or waits the semaphore changes its payload
+ * the same way.  The guest sends these on the ring it also submits on, and
+ * vk_mutex orders them against vkr's own submissions.
+ */
+static VkResult
+vkr_queue_submit_empty(struct vkr_device *dev, VkSemaphore wait, VkSemaphore signal)
+{
+   if (list_is_empty(&dev->queues))
+      return VK_ERROR_DEVICE_LOST;
+
+   struct vkr_queue *queue =
+      list_first_entry(&dev->queues, struct vkr_queue, base.track_head);
+   struct vn_device_proc_table *vk = &dev->proc_table;
+
+   const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+   const VkSubmitInfo submit_info = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .waitSemaphoreCount = wait != VK_NULL_HANDLE,
+      .pWaitSemaphores = &wait,
+      .pWaitDstStageMask = &wait_stage,
+      .signalSemaphoreCount = signal != VK_NULL_HANDLE,
+      .pSignalSemaphores = &signal,
+   };
+
+   mtx_lock(&queue->vk_mutex);
+   const VkResult result =
+      vk->QueueSubmit(queue->base.handle.queue, 1, &submit_info, VK_NULL_HANDLE);
+   mtx_unlock(&queue->vk_mutex);
+
+   return result;
+}
+
 static void
 vkr_dispatch_vkCreateFence(struct vn_dispatch_context *dispatch,
                            struct vn_command_vkCreateFence *args)
 {
+   vkr_strip_emulated_export_info(vkr_device_from_handle(args->device), args->pCreateInfo,
+                                  VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO);
    vkr_fence_create_and_add(dispatch->data, args);
 }
 
@@ -481,6 +532,15 @@ vkr_dispatch_vkResetFenceResourceMESA(struct vn_dispatch_context *dispatch,
 
    vn_replace_vkResetFenceResourceMESA_args_handle(args);
 
+   /* exporting a sync_fd resets the fence; emulated, wait for it and reset it */
+   if (!vk->GetFenceFdKHR) {
+      if (vk->WaitForFences(args->device, 1, &args->fence, VK_TRUE, UINT64_MAX) !=
+             VK_SUCCESS ||
+          vk->ResetFences(args->device, 1, &args->fence) != VK_SUCCESS)
+         vkr_context_set_fatal(ctx);
+      return;
+   }
+
    const VkFenceGetFdInfoKHR info = {
       .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
       .fence = args->fence,
@@ -500,6 +560,8 @@ static void
 vkr_dispatch_vkCreateSemaphore(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCreateSemaphore *args)
 {
+   vkr_strip_emulated_export_info(vkr_device_from_handle(args->device), args->pCreateInfo,
+                                  VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO);
    vkr_semaphore_create_and_add(dispatch->data, args);
 }
 
@@ -555,6 +617,13 @@ vkr_dispatch_vkWaitSemaphoreResourceMESA(
 
    vn_replace_vkWaitSemaphoreResourceMESA_args_handle(args);
 
+   /* exporting a sync_fd consumes the payload; emulated, wait on it */
+   if (!vk->GetSemaphoreFdKHR) {
+      if (vkr_queue_submit_empty(dev, args->semaphore, VK_NULL_HANDLE) != VK_SUCCESS)
+         vkr_context_set_fatal(ctx);
+      return;
+   }
+
    const VkSemaphoreGetFdInfoKHR info = {
       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
       .semaphore = args->semaphore,
@@ -585,6 +654,13 @@ vkr_dispatch_vkImportSemaphoreResourceMESA(
 
    /* resourceId 0 is for importing a signaled payload to sync_fd fence */
    assert(!res_info->resourceId);
+
+   /* emulated, signal it instead; the next wait consumes it like the import */
+   if (!vk->ImportSemaphoreFdKHR) {
+      if (vkr_queue_submit_empty(dev, VK_NULL_HANDLE, res_info->semaphore) != VK_SUCCESS)
+         vkr_context_set_fatal(ctx);
+      return;
+   }
 
    const VkImportSemaphoreFdInfoKHR import_info = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,

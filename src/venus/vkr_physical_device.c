@@ -242,6 +242,12 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
    }
 }
 
+/* advertised without host support when emulate_sync_fd is set */
+static const char *const vkr_emulated_sync_fd_extensions[] = {
+   "VK_KHR_external_semaphore_fd",
+   "VK_KHR_external_fence_fd",
+};
+
 static void
 vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
 {
@@ -275,6 +281,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          physical_dev->EXT_external_memory_dma_buf = true;
       else if (!strcmp(props->extensionName, "VK_KHR_external_fence_fd"))
          physical_dev->KHR_external_fence_fd = true;
+      else if (!strcmp(props->extensionName, "VK_KHR_external_semaphore_fd"))
+         physical_dev->KHR_external_semaphore_fd = true;
       else if (!strcmp(props->extensionName, "VK_EXT_external_memory_host"))
          physical_dev->EXT_external_memory_host = true;
 
@@ -313,8 +321,43 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          physical_dev->KHR_external_fence_fd = false;
    }
 
-   physical_dev->extensions = realloc(exts, sizeof(*exts) * advertised_count);
+#ifdef _WIN32
+   physical_dev->emulate_sync_fd =
+      !physical_dev->KHR_external_semaphore_fd && !physical_dev->KHR_external_fence_fd;
+#endif
+   const uint32_t emulated_count =
+      physical_dev->emulate_sync_fd ? ARRAY_SIZE(vkr_emulated_sync_fd_extensions) : 0;
+
+   VkExtensionProperties *advertised =
+      realloc(exts, sizeof(*exts) * (advertised_count + emulated_count));
+   if (!advertised) {
+      free(exts);
+      return;
+   }
+
+   for (uint32_t i = 0; i < emulated_count; i++) {
+      const char *name = vkr_emulated_sync_fd_extensions[i];
+      VkExtensionProperties *props = &advertised[advertised_count++];
+      snprintf(props->extensionName, sizeof(props->extensionName), "%s", name);
+      props->specVersion = vkr_extension_get_spec_version(name);
+   }
+
+   physical_dev->extensions = advertised;
    physical_dev->extension_count = advertised_count;
+}
+
+bool
+vkr_physical_device_is_emulated_extension(const struct vkr_physical_device *physical_dev,
+                                          const char *name)
+{
+   if (!physical_dev->emulate_sync_fd)
+      return false;
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(vkr_emulated_sync_fd_extensions); i++) {
+      if (!strcmp(name, vkr_emulated_sync_fd_extensions[i]))
+         return true;
+   }
+   return false;
 }
 
 static void
@@ -769,6 +812,23 @@ vkr_dispatch_vkGetPhysicalDeviceExternalSemaphoreProperties(
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
 
+   const VkPhysicalDeviceExternalSemaphoreInfo *info = args->pExternalSemaphoreInfo;
+   if (physical_dev->emulate_sync_fd &&
+       info->handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT) {
+      /* sync_fd payloads only exist for binary semaphores */
+      const VkSemaphoreTypeCreateInfo *type_info =
+         vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO);
+      const bool binary = !type_info || type_info->semaphoreType == VK_SEMAPHORE_TYPE_BINARY;
+      VkExternalSemaphoreProperties *props = args->pExternalSemaphoreProperties;
+      props->exportFromImportedHandleTypes = binary ? info->handleType : 0;
+      props->compatibleHandleTypes = binary ? info->handleType : 0;
+      props->externalSemaphoreFeatures =
+         binary ? VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
+                     VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT
+                : 0;
+      return;
+   }
+
    vn_replace_vkGetPhysicalDeviceExternalSemaphoreProperties_args_handle(args);
    vk->GetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
                                                     args->pExternalSemaphoreInfo,
@@ -783,6 +843,16 @@ vkr_dispatch_vkGetPhysicalDeviceExternalFenceProperties(
    struct vkr_physical_device *physical_dev =
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+   if (physical_dev->emulate_sync_fd &&
+       args->pExternalFenceInfo->handleType == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT) {
+      VkExternalFenceProperties *props = args->pExternalFenceProperties;
+      props->exportFromImportedHandleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+      props->compatibleHandleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+      props->externalFenceFeatures =
+         VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_FENCE_FEATURE_IMPORTABLE_BIT;
+      return;
+   }
 
    vn_replace_vkGetPhysicalDeviceExternalFenceProperties_args_handle(args);
    vk->GetPhysicalDeviceExternalFenceProperties(

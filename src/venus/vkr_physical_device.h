@@ -31,6 +31,13 @@ struct vkr_physical_device {
    bool EXT_external_memory_host;
    VkDeviceSize min_imported_host_pointer_alignment;
 
+   /* The guest only reaches sync_fd semaphores and fences through the venus
+    * MESA commands, so hosts without VK_KHR_external_{semaphore,fence}_fd
+    * (Windows) still advertise them and vkr_queue.c emulates the commands.
+    * Common WSI in the guest needs them for VK_KHR_swapchain.
+    */
+   bool emulate_sync_fd;
+
    VkPhysicalDeviceMemoryProperties memory_properties;
    VkPhysicalDeviceIDProperties id_properties;
    bool is_dma_buf_fd_export_supported;
@@ -51,5 +58,10 @@ vkr_context_init_physical_device_dispatch(struct vkr_context *ctx);
 void
 vkr_physical_device_destroy(struct vkr_context *ctx,
                             struct vkr_physical_device *physical_dev);
+
+/* Whether vkr advertises the device extension without host support. */
+bool
+vkr_physical_device_is_emulated_extension(const struct vkr_physical_device *physical_dev,
+                                          const char *name);
 
 #endif /* VKR_PHYSICAL_DEVICE_H */

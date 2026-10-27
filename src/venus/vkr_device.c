@@ -163,16 +163,22 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    ext_count += physical_dev->EXT_external_memory_dma_buf;
    ext_count += physical_dev->KHR_external_fence_fd;
    ext_count += append_external_memory_host;
-   if (ext_count > args->pCreateInfo->enabledExtensionCount) {
-      exts = malloc(sizeof(*exts) * ext_count);
+   /* emulated extensions are vkr's business and must not reach the driver */
+   if (ext_count > args->pCreateInfo->enabledExtensionCount ||
+       physical_dev->emulate_sync_fd) {
+      exts = malloc(sizeof(*exts) * MAX2(ext_count, 1));
       if (!exts) {
          args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
          return;
       }
-      for (uint32_t i = 0; i < args->pCreateInfo->enabledExtensionCount; i++)
-         exts[i] = args->pCreateInfo->ppEnabledExtensionNames[i];
 
-      ext_count = args->pCreateInfo->enabledExtensionCount;
+      ext_count = 0;
+      for (uint32_t i = 0; i < args->pCreateInfo->enabledExtensionCount; i++) {
+         const char *name = args->pCreateInfo->ppEnabledExtensionNames[i];
+         if (!vkr_physical_device_is_emulated_extension(physical_dev, name))
+            exts[ext_count++] = name;
+      }
+
       if (physical_dev->KHR_external_memory_fd)
          exts[ext_count++] = "VK_KHR_external_memory_fd";
       if (physical_dev->EXT_external_memory_dma_buf)
