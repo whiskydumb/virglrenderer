@@ -13553,8 +13553,8 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
          GLuint mem_object;
          glCreateMemoryObjectsEXT(1, &mem_object);
 #ifdef WIN32
-         /* venus exports dma-bufs from non-dedicated memory there (vkr_device_memory.c) */
-         GLint params = GL_FALSE;
+         /* venus drops the dedication where it can (vkr_device_memory.c) */
+         GLint params = res->vulkan_info.dedicated ? GL_TRUE : GL_FALSE;
 #else
          GLint params = GL_TRUE;
 #endif

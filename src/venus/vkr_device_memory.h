@@ -38,6 +38,7 @@ struct vkr_device_memory {
 
    uint64_t allocation_size;
    uint32_t memory_type_index;
+   bool dedicated;
 
    bool exported;
 };

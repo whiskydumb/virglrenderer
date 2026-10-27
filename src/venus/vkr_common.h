@@ -241,6 +241,21 @@ vkr_find_prev_struct(const void *chain, VkStructureType type)
    return NULL;
 }
 
+/*
+ * Unlink struct from the pNext of chain and return it.
+ */
+static inline void *
+vkr_unlink_struct(const void *chain, VkStructureType type)
+{
+   VkBaseOutStructure *prev = vkr_find_prev_struct(chain, type);
+   if (!prev)
+      return NULL;
+
+   VkBaseOutStructure *s = prev->pNext;
+   prev->pNext = s->pNext;
+   return s;
+}
+
 static inline bool
 vkr_is_recognized_object_type(VkObjectType type)
 {

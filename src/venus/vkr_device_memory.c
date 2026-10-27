@@ -6,9 +6,11 @@
 #include "vkr_device_memory.h"
 
 #include "venus-protocol/vn_protocol_renderer_transport.h"
-
 #include "virgl_os.h"
+
+#include "vkr_buffer.h"
 #include "vkr_device_memory_gen.h"
+#include "vkr_image.h"
 #include "vkr_physical_device.h"
 
 static void
@@ -34,6 +36,7 @@ vkr_device_memory_get_vulkan_info(const struct vkr_device_memory *mem,
 
    out_info->allocation_size = mem->allocation_size;
    out_info->memory_type_index = mem->memory_type_index;
+   out_info->dedicated = mem->dedicated;
 }
 
 #ifdef _WIN32
@@ -133,6 +136,36 @@ vkr_shm_get_import_info(struct vkr_device *dev,
    };
    *out_shm = shm;
    return VK_SUCCESS;
+}
+
+static bool
+vkr_dedicated_allocation_is_required(struct vkr_device *dev,
+                                     const VkMemoryDedicatedAllocateInfo *dedicated_info)
+{
+   struct vn_device_proc_table *vk = &dev->proc_table;
+   VkMemoryDedicatedRequirements dedicated_reqs = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+   };
+   VkMemoryRequirements2 reqs = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+      .pNext = &dedicated_reqs,
+   };
+
+   /* the handles are still vkr objects; vkr_device_memory_create_and_add replaces them */
+   if (dedicated_info->image != VK_NULL_HANDLE) {
+      const VkImageMemoryRequirementsInfo2 info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+         .image = vkr_image_from_handle(dedicated_info->image)->base.handle.image,
+      };
+      vk->GetImageMemoryRequirements2(dev->base.handle.device, &info, &reqs);
+   } else if (dedicated_info->buffer != VK_NULL_HANDLE) {
+      const VkBufferMemoryRequirementsInfo2 info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+         .buffer = vkr_buffer_from_handle(dedicated_info->buffer)->base.handle.buffer,
+      };
+      vk->GetBufferMemoryRequirements2(dev->base.handle.device, &info, &reqs);
+   }
+   return dedicated_reqs.requiresDedicatedAllocation;
 }
 
 /* Exports an emulated dma-buf as its OPAQUE_WIN32 handle, which vrend imports
@@ -458,17 +491,12 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
       /* nothing is exportable here; the shared memory section stands in for it */
       if (export_info) {
-         VkBaseInStructure *prev_of_export_info = vkr_find_prev_struct(
-            alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
-         prev_of_export_info->pNext = export_info->pNext;
+         vkr_unlink_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
          export_info = NULL;
       }
 
       /* host-pointer imports cannot be dedicated (VUID-VkMemoryAllocateInfo-pNext-02806) */
-      VkBaseInStructure *prev_of_dedicated_info =
-         vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
-      if (prev_of_dedicated_info)
-         prev_of_dedicated_info->pNext = prev_of_dedicated_info->pNext->pNext;
+      vkr_unlink_struct(alloc_info, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
 
       args->ret = vkr_shm_get_import_info(dev, alloc_info, &shm, &local_host_import_info);
       if (args->ret != VK_SUCCESS)
@@ -481,18 +509,14 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       /* guest dma-bufs are OPAQUE_WIN32 underneath, carried as OPAQUE fds */
       valid_fd_types = 1 << VIRGL_RESOURCE_FD_OPAQUE;
 
-      /* vrend samples these as textures (the wsi prime blit targets a linear
-       * buffer), and the GL driver takes a buffer-dedicated memory for an image
-       * one and crashes.  Buffers only take dedication as a hint, so drop it.
+      /* vrend views these as GL buffers, so drop the dedication wherever it
+       * is only a hint.  Where it is required (linear images on AMD), vrend
+       * learns it from vulkan_info and marks the GL memory object to match.
        */
-      VkBaseInStructure *prev_of_dedicated_info = vkr_find_prev_struct(
-         alloc_info, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
-      if (prev_of_dedicated_info) {
-         const VkMemoryDedicatedAllocateInfo *dedicated_info =
-            (const VkMemoryDedicatedAllocateInfo *)prev_of_dedicated_info->pNext;
-         if (dedicated_info->buffer != VK_NULL_HANDLE)
-            prev_of_dedicated_info->pNext = prev_of_dedicated_info->pNext->pNext;
-      }
+      const VkMemoryDedicatedAllocateInfo *dedicated_info = vkr_find_struct(
+         alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+      if (dedicated_info && !vkr_dedicated_allocation_is_required(dev, dedicated_info))
+         vkr_unlink_struct(alloc_info, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
    }
 #else
    VkExportMemoryAllocateInfo local_export_info;
@@ -602,6 +626,8 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->shm = shm;
    mem->allocation_size = alloc_info->allocationSize;
    mem->memory_type_index = alloc_info->memoryTypeIndex;
+   mem->dedicated = vkr_find_struct(alloc_info->pNext,
+                                    VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
 }
 
 static void
