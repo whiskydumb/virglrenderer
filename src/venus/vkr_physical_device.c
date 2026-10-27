@@ -248,6 +248,34 @@ static const char *const vkr_emulated_sync_fd_extensions[] = {
    "VK_KHR_external_fence_fd",
 };
 
+/* advertised without host support when emulate_dma_buf is set */
+static const char *const vkr_emulated_dma_buf_extensions[] = {
+   "VK_KHR_external_memory_fd",
+   "VK_EXT_external_memory_dma_buf",
+};
+
+static uint32_t
+vkr_append_emulated_extensions(VkExtensionProperties *props,
+                               const char *const *names,
+                               uint32_t name_count)
+{
+   for (uint32_t i = 0; i < name_count; i++) {
+      snprintf(props[i].extensionName, sizeof(props[i].extensionName), "%s", names[i]);
+      props[i].specVersion = vkr_extension_get_spec_version(names[i]);
+   }
+   return name_count;
+}
+
+static bool
+vkr_name_in_list(const char *name, const char *const *names, uint32_t name_count)
+{
+   for (uint32_t i = 0; i < name_count; i++) {
+      if (!strcmp(name, names[i]))
+         return true;
+   }
+   return false;
+}
+
 static void
 vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
 {
@@ -283,6 +311,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          physical_dev->KHR_external_fence_fd = true;
       else if (!strcmp(props->extensionName, "VK_KHR_external_semaphore_fd"))
          physical_dev->KHR_external_semaphore_fd = true;
+      else if (!strcmp(props->extensionName, "VK_KHR_external_memory_win32"))
+         physical_dev->KHR_external_memory_win32 = true;
       else if (!strcmp(props->extensionName, "VK_EXT_external_memory_host"))
          physical_dev->EXT_external_memory_host = true;
 
@@ -324,23 +354,25 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
 #ifdef _WIN32
    physical_dev->emulate_sync_fd =
       !physical_dev->KHR_external_semaphore_fd && !physical_dev->KHR_external_fence_fd;
+   physical_dev->emulate_dma_buf = physical_dev->KHR_external_memory_win32 &&
+                                   !physical_dev->EXT_external_memory_dma_buf;
 #endif
-   const uint32_t emulated_count =
+   const uint32_t sync_fd_count =
       physical_dev->emulate_sync_fd ? ARRAY_SIZE(vkr_emulated_sync_fd_extensions) : 0;
+   const uint32_t dma_buf_count =
+      physical_dev->emulate_dma_buf ? ARRAY_SIZE(vkr_emulated_dma_buf_extensions) : 0;
 
    VkExtensionProperties *advertised =
-      realloc(exts, sizeof(*exts) * (advertised_count + emulated_count));
+      realloc(exts, sizeof(*exts) * (advertised_count + sync_fd_count + dma_buf_count));
    if (!advertised) {
       free(exts);
       return;
    }
 
-   for (uint32_t i = 0; i < emulated_count; i++) {
-      const char *name = vkr_emulated_sync_fd_extensions[i];
-      VkExtensionProperties *props = &advertised[advertised_count++];
-      snprintf(props->extensionName, sizeof(props->extensionName), "%s", name);
-      props->specVersion = vkr_extension_get_spec_version(name);
-   }
+   advertised_count += vkr_append_emulated_extensions(
+      &advertised[advertised_count], vkr_emulated_sync_fd_extensions, sync_fd_count);
+   advertised_count += vkr_append_emulated_extensions(
+      &advertised[advertised_count], vkr_emulated_dma_buf_extensions, dma_buf_count);
 
    physical_dev->extensions = advertised;
    physical_dev->extension_count = advertised_count;
@@ -350,14 +382,44 @@ bool
 vkr_physical_device_is_emulated_extension(const struct vkr_physical_device *physical_dev,
                                           const char *name)
 {
-   if (!physical_dev->emulate_sync_fd)
+   return (physical_dev->emulate_sync_fd &&
+           vkr_name_in_list(name, vkr_emulated_sync_fd_extensions,
+                            ARRAY_SIZE(vkr_emulated_sync_fd_extensions))) ||
+          (physical_dev->emulate_dma_buf &&
+           vkr_name_in_list(name, vkr_emulated_dma_buf_extensions,
+                            ARRAY_SIZE(vkr_emulated_dma_buf_extensions)));
+}
+
+static const VkExternalMemoryHandleTypeFlags VKR_GUEST_FD_HANDLE_TYPES =
+   VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
+   VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+bool
+vkr_physical_device_translate_handle_types(const struct vkr_physical_device *physical_dev,
+                                           VkExternalMemoryHandleTypeFlags *handle_types)
+{
+   if (!physical_dev->emulate_dma_buf || !(*handle_types & VKR_GUEST_FD_HANDLE_TYPES))
       return false;
 
-   for (uint32_t i = 0; i < ARRAY_SIZE(vkr_emulated_sync_fd_extensions); i++) {
-      if (!strcmp(name, vkr_emulated_sync_fd_extensions[i]))
-         return true;
-   }
-   return false;
+   *handle_types = (*handle_types & ~VKR_GUEST_FD_HANDLE_TYPES) |
+                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+   return true;
+}
+
+void
+vkr_physical_device_untranslate_memory_properties(
+   const struct vkr_physical_device *physical_dev, VkExternalMemoryProperties *props)
+{
+   if (!physical_dev->emulate_dma_buf)
+      return;
+
+   const VkExternalMemoryHandleTypeFlags host =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+   const VkExternalMemoryHandleTypeFlags guest =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+   props->compatibleHandleTypes = (props->compatibleHandleTypes & host) ? guest : 0;
+   props->exportFromImportedHandleTypes =
+      (props->exportFromImportedHandleTypes & host) ? guest : 0;
 }
 
 static void
@@ -770,9 +832,27 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
 
+   VkPhysicalDeviceExternalImageFormatInfo *external_info =
+      vkr_find_struct(args->pImageFormatInfo->pNext,
+                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+   VkExternalMemoryHandleTypeFlags handle_type =
+      external_info ? external_info->handleType : 0;
+   const bool translated =
+      vkr_physical_device_translate_handle_types(physical_dev, &handle_type);
+   if (translated)
+      external_info->handleType = (VkExternalMemoryHandleTypeFlagBits)handle_type;
+
    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
+
+   VkExternalImageFormatProperties *external_props =
+      vkr_find_struct(args->pImageFormatProperties->pNext,
+                      VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
+   if (translated && args->ret == VK_SUCCESS && external_props) {
+      vkr_physical_device_untranslate_memory_properties(
+         physical_dev, &external_props->externalMemoryProperties);
+   }
 }
 
 static void
@@ -798,9 +878,22 @@ vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties(
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
 
+   VkPhysicalDeviceExternalBufferInfo *info =
+      (VkPhysicalDeviceExternalBufferInfo *)args->pExternalBufferInfo;
+   VkExternalMemoryHandleTypeFlags handle_type = info->handleType;
+   const bool translated =
+      vkr_physical_device_translate_handle_types(physical_dev, &handle_type);
+   if (translated)
+      info->handleType = (VkExternalMemoryHandleTypeFlagBits)handle_type;
+
    vn_replace_vkGetPhysicalDeviceExternalBufferProperties_args_handle(args);
    vk->GetPhysicalDeviceExternalBufferProperties(
       args->physicalDevice, args->pExternalBufferInfo, args->pExternalBufferProperties);
+
+   if (translated) {
+      vkr_physical_device_untranslate_memory_properties(
+         physical_dev, &args->pExternalBufferProperties->externalMemoryProperties);
+   }
 }
 
 static void

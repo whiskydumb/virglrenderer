@@ -12,6 +12,18 @@
 
 #include "vkr_context.h"
 
+/* VkMemoryGetWin32HandleInfoKHR and vkGetMemoryWin32HandleKHR; the venus
+ * headers lack vulkan_win32.h, and windows.h does not belong in vkr.
+ */
+struct vkr_memory_get_win32_handle_info {
+   VkStructureType sType;
+   const void *pNext;
+   VkDeviceMemory memory;
+   VkExternalMemoryHandleTypeFlagBits handleType;
+};
+typedef VkResult(VKAPI_PTR *vkr_get_memory_win32_handle_fn)(
+   VkDevice device, const struct vkr_memory_get_win32_handle_info *info, void **handle);
+
 struct vkr_device {
    struct vkr_object base;
 
@@ -21,6 +33,8 @@ struct vkr_device {
 
    /* not in the generated proc table; set when vkr enabled VK_EXT_external_memory_host */
    PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
+   /* likewise, set when vkr enabled VK_KHR_external_memory_win32 */
+   vkr_get_memory_win32_handle_fn GetMemoryWin32HandleKHR;
 
    struct list_head queues;
 

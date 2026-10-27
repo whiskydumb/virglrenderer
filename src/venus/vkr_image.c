@@ -31,6 +31,14 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     * situation because the app does not consider the memory external.
     */
 
+   VkExternalMemoryImageCreateInfo *external_info = vkr_find_struct(
+      args->pCreateInfo->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+   if (external_info) {
+      vkr_physical_device_translate_handle_types(
+         vkr_device_from_handle(args->device)->physical_device,
+         &external_info->handleTypes);
+   }
+
    vkr_image_create_and_add(dispatch->data, args);
 }
 

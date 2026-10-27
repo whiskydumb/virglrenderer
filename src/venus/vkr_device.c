@@ -81,7 +81,10 @@ vkr_device_init_proc_table(struct vkr_device *dev,
          dev->GetMemoryHostPointerPropertiesEXT =
             (PFN_vkGetMemoryHostPointerPropertiesEXT)vk->GetDeviceProcAddr(
                dev->base.handle.device, "vkGetMemoryHostPointerPropertiesEXT");
-         break;
+      } else if (!strcmp(exts[i], "VK_KHR_external_memory_win32")) {
+         dev->GetMemoryWin32HandleKHR =
+            (vkr_get_memory_win32_handle_fn)vk->GetDeviceProcAddr(
+               dev->base.handle.device, "vkGetMemoryWin32HandleKHR");
       }
    }
 }
@@ -155,14 +158,20 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    const bool append_external_memory_host =
       physical_dev->EXT_external_memory_host &&
       !vkr_device_extension_requested(args->pCreateInfo, "VK_EXT_external_memory_host");
+   /* emulated dma-bufs are OPAQUE_WIN32 underneath (vkr_device_memory.c) */
+   const bool append_external_memory_win32 =
+      physical_dev->emulate_dma_buf &&
+      !vkr_device_extension_requested(args->pCreateInfo, "VK_KHR_external_memory_win32");
 #else
    const bool append_external_memory_host = false;
+   const bool append_external_memory_win32 = false;
 #endif
    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
    ext_count += physical_dev->KHR_external_memory_fd;
    ext_count += physical_dev->EXT_external_memory_dma_buf;
    ext_count += physical_dev->KHR_external_fence_fd;
    ext_count += append_external_memory_host;
+   ext_count += append_external_memory_win32;
    /* emulated extensions are vkr's business and must not reach the driver */
    if (ext_count > args->pCreateInfo->enabledExtensionCount ||
        physical_dev->emulate_sync_fd) {
@@ -187,6 +196,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
          exts[ext_count++] = "VK_KHR_external_fence_fd";
       if (append_external_memory_host)
          exts[ext_count++] = "VK_EXT_external_memory_host";
+      if (append_external_memory_win32)
+         exts[ext_count++] = "VK_KHR_external_memory_win32";
 
       ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
       ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;

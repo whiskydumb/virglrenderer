@@ -38,6 +38,14 @@ struct vkr_physical_device {
     */
    bool emulate_sync_fd;
 
+   /* Hosts without dma-buf but with VK_KHR_external_memory_win32 (Windows)
+    * advertise dma-buf to the guest and use OPAQUE_WIN32 underneath: guest
+    * dma-bufs are virtio-gpu blobs, which the host only shares between its
+    * own contexts (vkr and vrend), so the host handle type is free to pick.
+    */
+   bool KHR_external_memory_win32;
+   bool emulate_dma_buf;
+
    VkPhysicalDeviceMemoryProperties memory_properties;
    VkPhysicalDeviceIDProperties id_properties;
    bool is_dma_buf_fd_export_supported;
@@ -63,5 +71,17 @@ vkr_physical_device_destroy(struct vkr_context *ctx,
 bool
 vkr_physical_device_is_emulated_extension(const struct vkr_physical_device *physical_dev,
                                           const char *name);
+
+/* Rewrites guest dma-buf (and opaque fd) handle types into the host handle
+ * type when dma-buf is emulated; returns whether anything changed.
+ */
+bool
+vkr_physical_device_translate_handle_types(const struct vkr_physical_device *physical_dev,
+                                           VkExternalMemoryHandleTypeFlags *handle_types);
+
+/* The reverse, for properties reported back to the guest. */
+void
+vkr_physical_device_untranslate_memory_properties(
+   const struct vkr_physical_device *physical_dev, VkExternalMemoryProperties *props);
 
 #endif /* VKR_PHYSICAL_DEVICE_H */

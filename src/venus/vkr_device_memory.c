@@ -20,6 +20,22 @@ vkr_shm_release(struct vkr_device_memory_shm *shm)
    *shm = (struct vkr_device_memory_shm){ .handle = -1 };
 }
 
+static void
+vkr_device_memory_get_vulkan_info(const struct vkr_device_memory *mem,
+                                  struct virgl_resource_vulkan_info *out_info)
+{
+   STATIC_ASSERT(sizeof(out_info->device_uuid) == VK_UUID_SIZE);
+   STATIC_ASSERT(sizeof(out_info->driver_uuid) == VK_UUID_SIZE);
+
+   const VkPhysicalDeviceIDProperties *id_props =
+      &mem->device->physical_device->id_properties;
+   memcpy(out_info->device_uuid, id_props->deviceUUID, VK_UUID_SIZE);
+   memcpy(out_info->driver_uuid, id_props->driverUUID, VK_UUID_SIZE);
+
+   out_info->allocation_size = mem->allocation_size;
+   out_info->memory_type_index = mem->memory_type_index;
+}
+
 #ifdef _WIN32
 
 /* The guest picked its memory type from the host list, but imported host
@@ -119,6 +135,44 @@ vkr_shm_get_import_info(struct vkr_device *dev,
    return VK_SUCCESS;
 }
 
+/* Exports an emulated dma-buf as its OPAQUE_WIN32 handle, which vrend imports
+ * as a GL memory object.
+ */
+static bool
+vkr_device_memory_export_win32(struct vkr_device_memory *mem,
+                               uint32_t map_info,
+                               struct virgl_context_blob *out_blob)
+{
+   struct vkr_device *dev = mem->device;
+   if (!dev->GetMemoryWin32HandleKHR) {
+      vkr_log("mem export needs VK_KHR_external_memory_win32");
+      return false;
+   }
+
+   const struct vkr_memory_get_win32_handle_info handle_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR,
+      .memory = mem->base.handle.device_memory,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+   };
+   void *handle = NULL;
+   VkResult ret =
+      dev->GetMemoryWin32HandleKHR(dev->base.handle.device, &handle_info, &handle);
+   if (ret != VK_SUCCESS) {
+      vkr_log("mem win32 handle export failed (vk ret %d)", ret);
+      return false;
+   }
+
+   mem->exported = true;
+   *out_blob = (struct virgl_context_blob){
+      .type = VIRGL_RESOURCE_FD_OPAQUE,
+      /* kernel handles fit in 32 bits; see virgl_os.h */
+      .u.fd = (int)(intptr_t)handle,
+      .map_info = map_info,
+   };
+   vkr_device_memory_get_vulkan_info(mem, &out_blob->vulkan_info);
+   return true;
+}
+
 #endif /* _WIN32 */
 
 static bool
@@ -132,6 +186,13 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
       vkr_context_set_fatal(ctx);
       return false;
    }
+
+#ifdef _WIN32
+   /* resources hold OPAQUE_WIN32 handles here; importing them is not wired up yet */
+   vkr_log("failed to import resource %u: not supported on Windows",
+           res_info->resourceId);
+   return false;
+#endif
 
    VkExternalMemoryHandleTypeFlagBits handle_type;
    switch (res->fd_type) {
@@ -415,6 +476,23 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
       alloc_info->pNext = &local_host_import_info;
       valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
+   } else if (export_info && vkr_physical_device_translate_handle_types(
+                                physical_dev, &export_info->handleTypes)) {
+      /* guest dma-bufs are OPAQUE_WIN32 underneath, carried as OPAQUE fds */
+      valid_fd_types = 1 << VIRGL_RESOURCE_FD_OPAQUE;
+
+      /* vrend samples these as textures (the wsi prime blit targets a linear
+       * buffer), and the GL driver takes a buffer-dedicated memory for an image
+       * one and crashes.  Buffers only take dedication as a hint, so drop it.
+       */
+      VkBaseInStructure *prev_of_dedicated_info = vkr_find_prev_struct(
+         alloc_info, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+      if (prev_of_dedicated_info) {
+         const VkMemoryDedicatedAllocateInfo *dedicated_info =
+            (const VkMemoryDedicatedAllocateInfo *)prev_of_dedicated_info->pNext;
+         if (dedicated_info->buffer != VK_NULL_HANDLE)
+            prev_of_dedicated_info->pNext = prev_of_dedicated_info->pNext->pNext;
+      }
    }
 #else
    VkExportMemoryAllocateInfo local_export_info;
@@ -694,6 +772,12 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       return true;
    }
 
+#ifdef _WIN32
+   /* the guest may ask for a cross-device blob; OPAQUE_WIN32 stands in for its dma-buf */
+   if (mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_OPAQUE))
+      return vkr_device_memory_export_win32(mem, map_info, out_blob);
+#endif
+
    const bool can_export_dma_buf = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_DMABUF);
    const bool can_export_opaque = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_OPAQUE);
    enum virgl_resource_fd_type fd_type;
@@ -714,17 +798,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       /* prefer opaque for performance? */
       fd_type = VIRGL_RESOURCE_FD_OPAQUE;
       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-
-      STATIC_ASSERT(sizeof(vulkan_info.device_uuid) == VK_UUID_SIZE);
-      STATIC_ASSERT(sizeof(vulkan_info.driver_uuid) == VK_UUID_SIZE);
-
-      const VkPhysicalDeviceIDProperties *id_props =
-         &mem->device->physical_device->id_properties;
-      memcpy(vulkan_info.device_uuid, id_props->deviceUUID, VK_UUID_SIZE);
-      memcpy(vulkan_info.driver_uuid, id_props->driverUUID, VK_UUID_SIZE);
-
-      vulkan_info.allocation_size = mem->allocation_size;
-      vulkan_info.memory_type_index = mem->memory_type_index;
+      vkr_device_memory_get_vulkan_info(mem, &vulkan_info);
    } else {
       vkr_log("mem is not exportable");
       return false;
