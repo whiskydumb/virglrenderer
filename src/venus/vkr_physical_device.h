@@ -27,6 +27,10 @@ struct vkr_physical_device {
    bool KHR_external_fence_fd;
    bool KHR_external_semaphore_fd;
 
+   /* backs mappable memory with shared memory where it cannot be exported (Windows) */
+   bool EXT_external_memory_host;
+   VkDeviceSize min_imported_host_pointer_alignment;
+
    VkPhysicalDeviceMemoryProperties memory_properties;
    VkPhysicalDeviceIDProperties id_properties;
    bool is_dma_buf_fd_export_supported;

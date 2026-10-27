@@ -19,6 +19,9 @@ struct vkr_device {
 
    struct vn_device_proc_table proc_table;
 
+   /* not in the generated proc table; set when vkr enabled VK_EXT_external_memory_host */
+   PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
+
    struct list_head queues;
 
    mtx_t free_sync_mutex;

@@ -75,7 +75,28 @@ vkr_device_init_proc_table(struct vkr_device *dev,
 
    vn_util_init_device_proc_table(dev->base.handle.device, vk->GetDeviceProcAddr,
                                   api_version, &ext_table, &dev->proc_table);
+
+   for (uint32_t i = 0; i < count; i++) {
+      if (!strcmp(exts[i], "VK_EXT_external_memory_host")) {
+         dev->GetMemoryHostPointerPropertiesEXT =
+            (PFN_vkGetMemoryHostPointerPropertiesEXT)vk->GetDeviceProcAddr(
+               dev->base.handle.device, "vkGetMemoryHostPointerPropertiesEXT");
+         break;
+      }
+   }
 }
+
+#ifdef _WIN32
+static bool
+vkr_device_extension_requested(const VkDeviceCreateInfo *create_info, const char *name)
+{
+   for (uint32_t i = 0; i < create_info->enabledExtensionCount; i++) {
+      if (!strcmp(create_info->ppEnabledExtensionNames[i], name))
+         return true;
+   }
+   return false;
+}
+#endif
 
 static void
 vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
@@ -129,10 +150,19 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
 
    /* append extensions for our own use */
    const char **exts = NULL;
+#ifdef _WIN32
+   /* mappable memory is backed by imported shared memory (vkr_device_memory.c) */
+   const bool append_external_memory_host =
+      physical_dev->EXT_external_memory_host &&
+      !vkr_device_extension_requested(args->pCreateInfo, "VK_EXT_external_memory_host");
+#else
+   const bool append_external_memory_host = false;
+#endif
    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
    ext_count += physical_dev->KHR_external_memory_fd;
    ext_count += physical_dev->EXT_external_memory_dma_buf;
    ext_count += physical_dev->KHR_external_fence_fd;
+   ext_count += append_external_memory_host;
    if (ext_count > args->pCreateInfo->enabledExtensionCount) {
       exts = malloc(sizeof(*exts) * ext_count);
       if (!exts) {
@@ -149,6 +179,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
          exts[ext_count++] = "VK_EXT_external_memory_dma_buf";
       if (physical_dev->KHR_external_fence_fd)
          exts[ext_count++] = "VK_KHR_external_fence_fd";
+      if (append_external_memory_host)
+         exts[ext_count++] = "VK_EXT_external_memory_host";
 
       ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
       ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;

@@ -275,6 +275,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          physical_dev->EXT_external_memory_dma_buf = true;
       else if (!strcmp(props->extensionName, "VK_KHR_external_fence_fd"))
          physical_dev->KHR_external_fence_fd = true;
+      else if (!strcmp(props->extensionName, "VK_EXT_external_memory_host"))
+         physical_dev->EXT_external_memory_host = true;
 
       const uint32_t spec_ver = vkr_extension_get_spec_version(props->extensionName);
       if (spec_ver) {
@@ -282,6 +284,19 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
             props->specVersion = spec_ver;
          exts[advertised_count++] = exts[i];
       }
+   }
+
+   if (physical_dev->EXT_external_memory_host) {
+      VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+      };
+      VkPhysicalDeviceProperties2 props2 = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+         .pNext = &host_props,
+      };
+      vk->GetPhysicalDeviceProperties2(handle, &props2);
+      physical_dev->min_imported_host_pointer_alignment =
+         host_props.minImportedHostPointerAlignment;
    }
 
    if (physical_dev->KHR_external_fence_fd) {

@@ -7,8 +7,119 @@
 
 #include "venus-protocol/vn_protocol_renderer_transport.h"
 
+#include "virgl_os.h"
 #include "vkr_device_memory_gen.h"
 #include "vkr_physical_device.h"
+
+static void
+vkr_shm_release(struct vkr_device_memory_shm *shm)
+{
+   if (shm->ptr)
+      virgl_os_shm_unmap(shm->ptr, shm->size);
+   virgl_os_handle_close(shm->handle);
+   *shm = (struct vkr_device_memory_shm){ .handle = -1 };
+}
+
+#ifdef _WIN32
+
+/* The guest picked its memory type from the host list, but imported host
+ * memory may only live in some types.  Keep the guest's type when it can hold
+ * the import and is cached; otherwise use an importable type with the guest's
+ * host flags plus HOST_CACHED, because guest mappings of uncached memory run
+ * at uncached speed.  Buffers and images normally accept every host-visible
+ * type, so the substitution stays invisible to the guest.
+ */
+static uint32_t
+vkr_shm_pick_memory_type(const struct vkr_physical_device *physical_dev,
+                         uint32_t importable_types,
+                         uint32_t requested)
+{
+   const VkPhysicalDeviceMemoryProperties *props = &physical_dev->memory_properties;
+   const VkMemoryPropertyFlags requested_flags = props->memoryTypes[requested].propertyFlags;
+   const VkMemoryPropertyFlags wanted =
+      (requested_flags &
+       (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) |
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+   if ((importable_types & (1u << requested)) && (requested_flags & wanted) == wanted)
+      return requested;
+
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      if ((importable_types & (1u << i)) &&
+          (props->memoryTypes[i].propertyFlags & wanted) == wanted)
+         return i;
+   }
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      if ((importable_types & (1u << i)) &&
+          (props->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+         return i;
+   }
+   return UINT32_MAX;
+}
+
+/* Windows has no dma-buf, and drivers may refuse to export host-visible
+ * memory at all.  Back mappable memory with shared memory instead, imported
+ * through VK_EXT_external_memory_host; the VMM maps its own view of it.  This
+ * is the udmabuf path with a section in place of the memfd.
+ */
+static VkResult
+vkr_shm_get_import_info(struct vkr_device *dev,
+                        VkMemoryAllocateInfo *alloc_info,
+                        struct vkr_device_memory_shm *out_shm,
+                        VkImportMemoryHostPointerInfoEXT *out_import_info)
+{
+   const struct vkr_physical_device *physical_dev = dev->physical_device;
+   if (!dev->GetMemoryHostPointerPropertiesEXT) {
+      vkr_log("mappable memory needs VK_EXT_external_memory_host on Windows");
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   const size_t alignment =
+      MAX2(virgl_os_page_size(), physical_dev->min_imported_host_pointer_alignment);
+   struct vkr_device_memory_shm shm = {
+      .handle = -1,
+      .size = align64(alloc_info->allocationSize, alignment),
+   };
+   shm.handle = virgl_os_shm_create(shm.size, "vkr-device-memory");
+   if (shm.handle >= 0)
+      shm.ptr = virgl_os_shm_map(shm.handle, shm.size);
+   if (!shm.ptr) {
+      vkr_log("failed to create %zu bytes of shared memory", shm.size);
+      vkr_shm_release(&shm);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   VkMemoryHostPointerPropertiesEXT host_props = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
+   };
+   VkResult ret = dev->GetMemoryHostPointerPropertiesEXT(
+      dev->base.handle.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+      shm.ptr, &host_props);
+   const uint32_t mem_type_index =
+      ret == VK_SUCCESS
+         ? vkr_shm_pick_memory_type(physical_dev, host_props.memoryTypeBits,
+                                    alloc_info->memoryTypeIndex)
+         : UINT32_MAX;
+   if (mem_type_index == UINT32_MAX) {
+      vkr_log("shared memory cannot back memory type %u (vk ret %d, importable 0x%x)",
+              alloc_info->memoryTypeIndex, ret, host_props.memoryTypeBits);
+      vkr_shm_release(&shm);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   alloc_info->memoryTypeIndex = mem_type_index;
+   alloc_info->allocationSize = shm.size;
+   *out_import_info = (VkImportMemoryHostPointerInfoEXT){
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+      .pNext = alloc_info->pNext,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+      .pHostPointer = shm.ptr,
+   };
+   *out_shm = shm;
+   return VK_SUCCESS;
+}
+
+#endif /* _WIN32 */
 
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
@@ -280,6 +391,26 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    uint32_t valid_fd_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
+   struct vkr_device_memory_shm shm = { .handle = -1 };
+#ifdef _WIN32
+   VkImportMemoryHostPointerInfoEXT local_host_import_info;
+   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+      /* nothing is exportable here; the shared memory section stands in for it */
+      if (export_info) {
+         VkBaseInStructure *prev_of_export_info = vkr_find_prev_struct(
+            alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+         prev_of_export_info->pNext = export_info->pNext;
+         export_info = NULL;
+      }
+
+      args->ret = vkr_shm_get_import_info(dev, alloc_info, &shm, &local_host_import_info);
+      if (args->ret != VK_SUCCESS)
+         return;
+
+      alloc_info->pNext = &local_host_import_info;
+      valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
+   }
+#else
    VkExportMemoryAllocateInfo local_export_info;
    if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
       /* An implementation can support dma_buf import along with opaque fd export/import.
@@ -357,6 +488,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
       }
    }
+#endif /* _WIN32 */
 
    if (export_info) {
       if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
@@ -371,17 +503,21 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          close(local_import_info.fd);
       if (gbm_bo)
          vkr_gbm_bo_destroy(gbm_bo);
+      vkr_shm_release(&shm);
       return;
    }
 
    mem->device = dev;
    mem->might_export = might_export;
-   mem->property_flags = property_flags;
+   /* the shm path may have moved the allocation to another memory type */
+   mem->property_flags =
+      physical_dev->memory_properties.memoryTypes[alloc_info->memoryTypeIndex].propertyFlags;
    mem->valid_fd_types = valid_fd_types;
    mem->udmabuf_fd = udmabuf_fd;
    mem->gbm_bo = gbm_bo;
+   mem->shm = shm;
    mem->allocation_size = alloc_info->allocationSize;
-   mem->memory_type_index = mem_type_index;
+   mem->memory_type_index = alloc_info->memoryTypeIndex;
 }
 
 static void
@@ -393,8 +529,12 @@ vkr_dispatch_vkFreeMemory(struct vn_dispatch_context *dispatch,
    if (!mem)
       return;
 
-   vkr_device_memory_release(mem);
+   /* Release the backing only after the VkDeviceMemory imported from it is
+    * gone; removing the object frees mem, so keep a copy of the fields.
+    */
+   struct vkr_device_memory backing = *mem;
    vkr_device_memory_destroy_and_remove(dispatch->data, args);
+   vkr_device_memory_release(&backing);
 }
 
 static void
@@ -492,6 +632,7 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
       vkr_gbm_bo_destroy(mem->gbm_bo);
    if (mem->udmabuf_fd >= 0)
       close(mem->udmabuf_fd);
+   vkr_shm_release(&mem->shm);
 }
 
 bool
@@ -523,6 +664,28 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       /* XXX guessed */
       map_info = (coherent && cached) ? VIRGL_RENDERER_MAP_CACHE_CACHED
                                       : VIRGL_RENDERER_MAP_CACHE_WC;
+   }
+
+   if (mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_SHM)) {
+      if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE) {
+         vkr_log("shm-backed mem cannot be shared across devices");
+         return false;
+      }
+
+      /* the resource owns its own handle, so the section outlives this mem */
+      const int fd = virgl_os_handle_dup(mem->shm.handle);
+      if (fd < 0) {
+         vkr_log("mem shm handle dup failed");
+         return false;
+      }
+
+      mem->exported = true;
+      *out_blob = (struct virgl_context_blob){
+         .type = VIRGL_RESOURCE_FD_SHM,
+         .u.fd = fd,
+         .map_info = map_info,
+      };
+      return true;
    }
 
    const bool can_export_dma_buf = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_DMABUF);
