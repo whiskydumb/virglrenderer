@@ -5,11 +5,9 @@
 
 #include "vkr_context.h"
 
-#include <sys/mman.h>
 #include <sys/types.h>
-#include <unistd.h>
 
-#include "util/anon_file.h"
+#include "virgl_os.h"
 #include "venus-protocol/vn_protocol_renderer_dispatches.h"
 
 #define XXH_INLINE_ALL
@@ -188,9 +186,9 @@ vkr_context_free_resource(struct hash_entry *entry)
 {
    struct vkr_resource *res = entry->data;
    if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
-      munmap(res->u.data, res->size);
+      virgl_os_shm_unmap(res->u.data, res->size);
    else if (res->u.fd >= 0)
-      close(res->u.fd);
+      virgl_os_handle_close(res->u.fd);
    free(res);
 }
 
@@ -259,13 +257,13 @@ vkr_context_import_resource_from_shm(struct vkr_context *ctx,
 {
    assert(!vkr_context_get_resource(ctx, res_id));
 
-   void *mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-   if (mmap_ptr == MAP_FAILED)
+   void *mmap_ptr = virgl_os_shm_map(fd, blob_size);
+   if (!mmap_ptr)
       return false;
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
                                              VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
-      munmap(mmap_ptr, blob_size);
+      virgl_os_shm_unmap(mmap_ptr, blob_size);
       return false;
    }
 
@@ -280,20 +278,20 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
 {
    assert(!vkr_context_get_resource(ctx, res_id));
 
-   int fd = os_create_anonymous_file(blob_size, "vkr-shmem");
+   int fd = virgl_os_shm_create(blob_size, "vkr-shmem");
    if (fd < 0)
       return false;
 
-   void *mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-   if (mmap_ptr == MAP_FAILED) {
-      close(fd);
+   void *mmap_ptr = virgl_os_shm_map(fd, blob_size);
+   if (!mmap_ptr) {
+      virgl_os_handle_close(fd);
       return false;
    }
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
                                              VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
-      munmap(mmap_ptr, blob_size);
-      close(fd);
+      virgl_os_shm_unmap(mmap_ptr, blob_size);
+      virgl_os_handle_close(fd);
       return false;
    }
 
@@ -324,24 +322,41 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
       return false;
 
+   /* Memory backed by shared memory (the section path on Windows) becomes a
+    * regular shm resource, which vkr always keeps mapped.
+    */
+   if (blob.type == VIRGL_RESOURCE_FD_SHM) {
+      void *mmap_ptr = virgl_os_shm_map(blob.u.fd, blob_size);
+      if (!mmap_ptr ||
+          !vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, -1,
+                                                mmap_ptr)) {
+         if (mmap_ptr)
+            virgl_os_shm_unmap(mmap_ptr, blob_size);
+         virgl_os_handle_close(blob.u.fd);
+         return false;
+      }
+
+      *out_blob = blob;
+      return true;
+   }
+
    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
     * - vkAllocateMemory for dma_buf import
     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
     */
    int res_fd = -1;
    if (mem->might_export) {
-      res_fd = os_dupfd_cloexec(blob.u.fd);
+      res_fd = virgl_os_handle_dup(blob.u.fd);
       if (res_fd < 0) {
-         close(blob.u.fd);
+         virgl_os_handle_close(blob.u.fd);
          return false;
       }
    }
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, res_fd,
                                              NULL)) {
-      if (res_fd >= 0)
-         close(res_fd);
-      close(blob.u.fd);
+      virgl_os_handle_close(res_fd);
+      virgl_os_handle_close(blob.u.fd);
       return false;
    }
 

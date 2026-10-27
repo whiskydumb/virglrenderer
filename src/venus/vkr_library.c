@@ -6,7 +6,9 @@
 #include "vkr_common.h"
 #include "vkr_library.h"
 
+#if defined(ENABLE_VULKAN_DLOAD)
 #include <dlfcn.h>
+#endif
 
 void
 vkr_library_preload_icd(void)

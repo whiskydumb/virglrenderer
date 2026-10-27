@@ -6,7 +6,9 @@
 #include "vkr_ring.h"
 
 #include <stdio.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include <time.h>
 
 #include "venus-protocol/vn_protocol_renderer_dispatches.h"
@@ -249,6 +251,8 @@ vkr_ring_thread(void *arg)
 
    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
    u_thread_setname(thread_name);
+#ifndef _WIN32
+   /* nice values have no direct Windows counterpart; rings keep the default priority there */
    if (ring->prio_valid && setpriority(PRIO_PROCESS, 0, ring->prio)) {
 #ifdef DEBUG
       /* Currently venus doesn't forward the CAP_SYS_NICE request upon forking, so
@@ -258,6 +262,7 @@ vkr_ring_thread(void *arg)
       vkr_log("failed to set ring thread priority to %d (%d)", ring->prio, errno);
 #endif
    }
+#endif
 
    uint64_t last_submit = vkr_ring_now();
    uint32_t relax_iter = 0;
@@ -348,11 +353,22 @@ vkr_ring_start(struct vkr_ring *ring)
       ring->started = false;
 }
 
+static bool
+vkr_ring_is_current_thread(const struct vkr_ring *ring)
+{
+#ifdef _WIN32
+   /* Mesa's win32 threads have no thrd_current(); compare thread ids like thrd_equal does */
+   return GetThreadId(ring->thread) == GetCurrentThreadId();
+#else
+   return thrd_equal(ring->thread, thrd_current());
+#endif
+}
+
 bool
 vkr_ring_stop(struct vkr_ring *ring)
 {
    mtx_lock(&ring->mutex);
-   if (thrd_equal(ring->thread, thrd_current())) {
+   if (vkr_ring_is_current_thread(ring)) {
       mtx_unlock(&ring->mutex);
       return false;
    }
