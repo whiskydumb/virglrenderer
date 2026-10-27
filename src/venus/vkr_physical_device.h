@@ -10,6 +10,9 @@
 
 #include "venus-protocol/vn_protocol_renderer_util.h"
 
+/* the only modifier of an emulated VK_EXT_image_drm_format_modifier */
+#define VKR_DRM_FORMAT_MOD_LINEAR 0ull
+
 struct vkr_physical_device {
    struct vkr_object base;
 
@@ -45,6 +48,14 @@ struct vkr_physical_device {
     */
    bool KHR_external_memory_win32;
    bool emulate_dma_buf;
+
+   /* With emulated dma-buf, VK_EXT_image_drm_format_modifier is advertised
+    * too, with DRM_FORMAT_MOD_LINEAR as the only modifier.  It is
+    * VK_IMAGE_TILING_LINEAR on the host, so the guest WSI can share linear
+    * images directly instead of blitting into a linear buffer.
+    */
+   bool EXT_image_drm_format_modifier;
+   bool emulate_drm_format_modifier;
 
    VkPhysicalDeviceMemoryProperties memory_properties;
    VkPhysicalDeviceIDProperties id_properties;

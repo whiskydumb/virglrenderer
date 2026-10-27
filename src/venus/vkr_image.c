@@ -8,6 +8,50 @@
 #include "vkr_image_gen.h"
 #include "vkr_physical_device.h"
 
+/* With an emulated VK_EXT_image_drm_format_modifier (vkr_physical_device.h),
+ * DRM_FORMAT_MOD_LINEAR becomes VK_IMAGE_TILING_LINEAR.
+ */
+static VkResult
+vkr_image_lower_drm_format_modifier(const struct vkr_device *dev, VkImageCreateInfo *info)
+{
+   if (!dev->physical_device->emulate_drm_format_modifier ||
+       info->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+      return VK_SUCCESS;
+
+   /* Explicit layouts come with imported dma-bufs, which are not supported
+    * here, and the host has no say in the pitch of a linear image anyway.
+    */
+   if (vkr_find_struct(
+          info->pNext,
+          VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT))
+      return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+
+   const VkImageDrmFormatModifierListCreateInfoEXT *list = vkr_unlink_struct(
+      info, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+   if (!list)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   for (uint32_t i = 0; i < list->drmFormatModifierCount; i++) {
+      if (list->pDrmFormatModifiers[i] == VKR_DRM_FORMAT_MOD_LINEAR) {
+         info->tiling = VK_IMAGE_TILING_LINEAR;
+         return VK_SUCCESS;
+      }
+   }
+   return VK_ERROR_FORMAT_NOT_SUPPORTED;
+}
+
+/* Lowered images are single-plane and linear, so memory plane 0 is the color
+ * plane.
+ */
+static void
+vkr_image_lower_memory_plane_aspect(const struct vkr_device *dev,
+                                    const VkImageAspectFlags *aspect)
+{
+   if (dev->physical_device->emulate_drm_format_modifier &&
+       *aspect == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)
+      *(VkImageAspectFlags *)aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+}
+
 static void
 vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                            struct vn_command_vkCreateImage *args)
@@ -31,12 +75,17 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     * situation because the app does not consider the memory external.
     */
 
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   args->ret =
+      vkr_image_lower_drm_format_modifier(dev, (VkImageCreateInfo *)args->pCreateInfo);
+   if (args->ret != VK_SUCCESS)
+      return;
+
    VkExternalMemoryImageCreateInfo *external_info = vkr_find_struct(
       args->pCreateInfo->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
    if (external_info) {
-      vkr_physical_device_translate_handle_types(
-         vkr_device_from_handle(args->device)->physical_device,
-         &external_info->handleTypes);
+      vkr_physical_device_translate_handle_types(dev->physical_device,
+                                                 &external_info->handleTypes);
    }
 
    vkr_image_create_and_add(dispatch->data, args);
@@ -132,6 +181,8 @@ vkr_dispatch_vkGetImageSubresourceLayout(
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
+   vkr_image_lower_memory_plane_aspect(dev, &args->pSubresource->aspectMask);
+
    vn_replace_vkGetImageSubresourceLayout_args_handle(args);
    vk->GetImageSubresourceLayout(args->device, args->image, args->pSubresource,
                                  args->pLayout);
@@ -144,6 +195,9 @@ vkr_dispatch_vkGetImageSubresourceLayout2(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+   vkr_image_lower_memory_plane_aspect(dev,
+                                       &args->pSubresource->imageSubresource.aspectMask);
 
    vn_replace_vkGetImageSubresourceLayout2_args_handle(args);
    vk->GetImageSubresourceLayout2(args->device, args->image, args->pSubresource,
@@ -158,6 +212,12 @@ vkr_dispatch_vkGetDeviceImageSubresourceLayout(
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
+   if (vkr_image_lower_drm_format_modifier(
+          dev, (VkImageCreateInfo *)args->pInfo->pCreateInfo) != VK_SUCCESS)
+      return;
+   vkr_image_lower_memory_plane_aspect(
+      dev, &args->pInfo->pSubresource->imageSubresource.aspectMask);
+
    vn_replace_vkGetDeviceImageSubresourceLayout_args_handle(args);
    vk->GetDeviceImageSubresourceLayout(args->device, args->pInfo, args->pLayout);
 }
@@ -169,6 +229,13 @@ vkr_dispatch_vkGetImageDrmFormatModifierPropertiesEXT(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+   /* emulated modifiers only ever lower to linear */
+   if (dev->physical_device->emulate_drm_format_modifier) {
+      args->pProperties->drmFormatModifier = VKR_DRM_FORMAT_MOD_LINEAR;
+      args->ret = VK_SUCCESS;
+      return;
+   }
 
    vn_replace_vkGetImageDrmFormatModifierPropertiesEXT_args_handle(args);
    args->ret = vk->GetImageDrmFormatModifierPropertiesEXT(args->device, args->image,
@@ -226,6 +293,10 @@ vkr_dispatch_vkGetDeviceImageMemoryRequirements(
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+   if (vkr_image_lower_drm_format_modifier(
+          dev, (VkImageCreateInfo *)args->pInfo->pCreateInfo) != VK_SUCCESS)
+      return;
 
    vn_replace_vkGetDeviceImageMemoryRequirements_args_handle(args);
    vk->GetDeviceImageMemoryRequirements(args->device, args->pInfo,

@@ -254,6 +254,11 @@ static const char *const vkr_emulated_dma_buf_extensions[] = {
    "VK_EXT_external_memory_dma_buf",
 };
 
+/* advertised without host support when emulate_drm_format_modifier is set */
+static const char *const vkr_emulated_drm_format_modifier_extensions[] = {
+   "VK_EXT_image_drm_format_modifier",
+};
+
 static uint32_t
 vkr_append_emulated_extensions(VkExtensionProperties *props,
                                const char *const *names,
@@ -315,6 +320,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          physical_dev->KHR_external_memory_win32 = true;
       else if (!strcmp(props->extensionName, "VK_EXT_external_memory_host"))
          physical_dev->EXT_external_memory_host = true;
+      else if (!strcmp(props->extensionName, "VK_EXT_image_drm_format_modifier"))
+         physical_dev->EXT_image_drm_format_modifier = true;
 
       const uint32_t spec_ver = vkr_extension_get_spec_version(props->extensionName);
       if (spec_ver) {
@@ -356,14 +363,21 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
       !physical_dev->KHR_external_semaphore_fd && !physical_dev->KHR_external_fence_fd;
    physical_dev->emulate_dma_buf = physical_dev->KHR_external_memory_win32 &&
                                    !physical_dev->EXT_external_memory_dma_buf;
+   physical_dev->emulate_drm_format_modifier =
+      physical_dev->emulate_dma_buf && !physical_dev->EXT_image_drm_format_modifier;
 #endif
    const uint32_t sync_fd_count =
       physical_dev->emulate_sync_fd ? ARRAY_SIZE(vkr_emulated_sync_fd_extensions) : 0;
    const uint32_t dma_buf_count =
       physical_dev->emulate_dma_buf ? ARRAY_SIZE(vkr_emulated_dma_buf_extensions) : 0;
+   const uint32_t drm_format_modifier_count =
+      physical_dev->emulate_drm_format_modifier
+         ? ARRAY_SIZE(vkr_emulated_drm_format_modifier_extensions)
+         : 0;
 
    VkExtensionProperties *advertised =
-      realloc(exts, sizeof(*exts) * (advertised_count + sync_fd_count + dma_buf_count));
+      realloc(exts, sizeof(*exts) * (advertised_count + sync_fd_count + dma_buf_count +
+                                     drm_format_modifier_count));
    if (!advertised) {
       free(exts);
       return;
@@ -373,6 +387,9 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
       &advertised[advertised_count], vkr_emulated_sync_fd_extensions, sync_fd_count);
    advertised_count += vkr_append_emulated_extensions(
       &advertised[advertised_count], vkr_emulated_dma_buf_extensions, dma_buf_count);
+   advertised_count += vkr_append_emulated_extensions(
+      &advertised[advertised_count], vkr_emulated_drm_format_modifier_extensions,
+      drm_format_modifier_count);
 
    physical_dev->extensions = advertised;
    physical_dev->extension_count = advertised_count;
@@ -387,7 +404,10 @@ vkr_physical_device_is_emulated_extension(const struct vkr_physical_device *phys
                             ARRAY_SIZE(vkr_emulated_sync_fd_extensions))) ||
           (physical_dev->emulate_dma_buf &&
            vkr_name_in_list(name, vkr_emulated_dma_buf_extensions,
-                            ARRAY_SIZE(vkr_emulated_dma_buf_extensions)));
+                            ARRAY_SIZE(vkr_emulated_dma_buf_extensions))) ||
+          (physical_dev->emulate_drm_format_modifier &&
+           vkr_name_in_list(name, vkr_emulated_drm_format_modifier_extensions,
+                            ARRAY_SIZE(vkr_emulated_drm_format_modifier_extensions)));
 }
 
 static const VkExternalMemoryHandleTypeFlags VKR_GUEST_FD_HANDLE_TYPES =
@@ -809,6 +829,54 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
    }
 }
 
+/* Emulated DRM_FORMAT_MOD_LINEAR covers single-plane formats only: multi-planar
+ * linear images would need per-plane layouts, which guest WSI never uses.
+ */
+static bool
+vkr_format_takes_linear_modifier(VkFormat format)
+{
+   const bool ycbcr = (format >= VK_FORMAT_G8B8G8R8_422_UNORM &&
+                       format <= VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM) ||
+                      (format >= VK_FORMAT_G8_B8R8_2PLANE_444_UNORM &&
+                       format <= VK_FORMAT_G16_B16R16_2PLANE_444_UNORM);
+   return !ycbcr;
+}
+
+/* The entry count of an emulated modifier list: LINEAR alone, if it has
+ * features.  query is set when the guest only asks for the count.
+ */
+static uint32_t
+vkr_linear_modifier_count(uint32_t capacity, bool query, bool has_features)
+{
+   const uint32_t count = has_features ? 1 : 0;
+   return query ? count : MIN2(count, capacity);
+}
+
+/* An output struct hidden from the driver for one call.  The guest decodes
+ * replies in chain order, so it goes back where it was; unhide in reverse.
+ */
+struct vkr_hidden_struct {
+   VkBaseOutStructure *prev;
+   VkBaseOutStructure *hidden;
+};
+
+static void *
+vkr_hide_struct(struct vkr_hidden_struct *state, void *chain, VkStructureType type)
+{
+   state->prev = vkr_find_prev_struct(chain, type);
+   state->hidden = state->prev ? state->prev->pNext : NULL;
+   if (state->hidden)
+      state->prev->pNext = state->hidden->pNext;
+   return state->hidden;
+}
+
+static void
+vkr_unhide_struct(const struct vkr_hidden_struct *state)
+{
+   if (state->hidden)
+      state->prev->pNext = state->hidden;
+}
+
 static void
 vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
    UNUSED struct vn_dispatch_context *dispatch,
@@ -817,10 +885,66 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
    struct vkr_physical_device *physical_dev =
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+   VkFormatProperties2 *props = args->pFormatProperties;
+
+   /* the driver knows no modifier lists; they are filled from linear tiling */
+   struct vkr_hidden_struct hidden_list = { 0 };
+   struct vkr_hidden_struct hidden_list2 = { 0 };
+   VkDrmFormatModifierPropertiesListEXT *list = NULL;
+   VkDrmFormatModifierPropertiesList2EXT *list2 = NULL;
+   if (physical_dev->emulate_drm_format_modifier) {
+      list = vkr_hide_struct(&hidden_list, props,
+                             VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
+      list2 =
+         vkr_hide_struct(&hidden_list2, props,
+                         VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
+   }
+
+   /* list2 takes its features from VkFormatProperties3 */
+   VkFormatProperties3 local_props3 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 };
+   VkFormatProperties3 *props3 =
+      vkr_find_struct(props->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3);
+   if (list2 && !props3) {
+      local_props3.pNext = props->pNext;
+      props->pNext = &local_props3;
+      props3 = &local_props3;
+   }
 
    vn_replace_vkGetPhysicalDeviceFormatProperties2_args_handle(args);
-   vk->GetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format,
-                                          args->pFormatProperties);
+   vk->GetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format, props);
+
+   if (props3 == &local_props3)
+      props->pNext = local_props3.pNext;
+
+   const bool linear = vkr_format_takes_linear_modifier(args->format);
+   if (list) {
+      const VkFormatFeatureFlags features =
+         linear ? props->formatProperties.linearTilingFeatures : 0;
+      list->drmFormatModifierCount = vkr_linear_modifier_count(
+         list->drmFormatModifierCount, !list->pDrmFormatModifierProperties, features);
+      if (list->pDrmFormatModifierProperties && list->drmFormatModifierCount) {
+         list->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierPropertiesEXT){
+            .drmFormatModifier = VKR_DRM_FORMAT_MOD_LINEAR,
+            .drmFormatModifierPlaneCount = 1,
+            .drmFormatModifierTilingFeatures = features,
+         };
+      }
+   }
+   if (list2) {
+      const VkFormatFeatureFlags2 features = linear ? props3->linearTilingFeatures : 0;
+      list2->drmFormatModifierCount = vkr_linear_modifier_count(
+         list2->drmFormatModifierCount, !list2->pDrmFormatModifierProperties, features);
+      if (list2->pDrmFormatModifierProperties && list2->drmFormatModifierCount) {
+         list2->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierProperties2EXT){
+            .drmFormatModifier = VKR_DRM_FORMAT_MOD_LINEAR,
+            .drmFormatModifierPlaneCount = 1,
+            .drmFormatModifierTilingFeatures = features,
+         };
+      }
+   }
+
+   vkr_unhide_struct(&hidden_list2);
+   vkr_unhide_struct(&hidden_list);
 }
 
 static void
@@ -831,6 +955,23 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    struct vkr_physical_device *physical_dev =
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+   VkPhysicalDeviceImageFormatInfo2 *format_info =
+      (VkPhysicalDeviceImageFormatInfo2 *)args->pImageFormatInfo;
+   if (physical_dev->emulate_drm_format_modifier &&
+       format_info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *modifier_info =
+         vkr_unlink_struct(
+            format_info,
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+      if (!modifier_info ||
+          modifier_info->drmFormatModifier != VKR_DRM_FORMAT_MOD_LINEAR ||
+          !vkr_format_takes_linear_modifier(format_info->format)) {
+         args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
+         return;
+      }
+      format_info->tiling = VK_IMAGE_TILING_LINEAR;
+   }
 
    VkPhysicalDeviceExternalImageFormatInfo *external_info =
       vkr_find_struct(args->pImageFormatInfo->pNext,
