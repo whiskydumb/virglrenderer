@@ -111,6 +111,16 @@ struct vrend_resource {
    uint64_t size;
    GLbitfield buffer_storage_flags;
    GLuint memobj;
+#ifdef WIN32
+   /* the NT handle memobj was imported from; it must outlive memobj */
+   int memobj_handle;
+   /* a linear image in memobj, viewed as a buffer and copied into the
+    * texture before draws (vrend_resource_refresh_from_memobj)
+    */
+   GLuint memobj_buffer;
+   uint32_t memobj_stride;
+   uint32_t memobj_offset;
+#endif
 
    uint32_t blob_id;
    struct list_head head;

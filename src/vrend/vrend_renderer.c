@@ -77,6 +77,8 @@
 #include <dxgi1_2.h>
 #endif
 
+#include "virgl_os.h"
+
 /*
  * VIRTGPU_DRM_CAPSET_VIRGL has version 0 and 1, but they are both
  * virgl_caps_v1 and are exactly the same.
@@ -177,6 +179,7 @@ enum features_id
    feat_khr_debug,
    feat_memory_object,
    feat_memory_object_fd,
+   feat_memory_object_win32,
    feat_mesa_invert,
    feat_ms_scaled_blit,
    feat_multisample,
@@ -290,6 +293,7 @@ static const  struct {
    FEAT(khr_debug, 43, 32,  "GL_KHR_debug" ),
    FEAT(memory_object, UNAVAIL, UNAVAIL, "GL_EXT_memory_object"),
    FEAT(memory_object_fd, UNAVAIL, UNAVAIL, "GL_EXT_memory_object_fd"),
+   FEAT(memory_object_win32, UNAVAIL, UNAVAIL, "GL_EXT_memory_object_win32"),
    FEAT(mesa_invert, UNAVAIL, UNAVAIL,  "GL_MESA_pack_invert" ),
    FEAT(ms_scaled_blit, UNAVAIL, UNAVAIL,  "GL_EXT_framebuffer_multisample_blit_scaled" ),
    FEAT(multisample, 32, 30,  "GL_ARB_texture_multisample" ),
@@ -5231,6 +5235,49 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
    }
 }
 
+#ifdef WIN32
+/* The guest picks the linear layout of an imported image; it must stay inside
+ * the imported memory.
+ */
+static bool
+vrend_memobj_layout_is_valid(enum virgl_formats format,
+                             uint64_t size,
+                             const struct vrend_renderer_resource_set_type_args *args)
+{
+   const uint64_t cpp = util_format_get_blocksize(format);
+   const uint64_t row = cpp * args->width;
+   const uint64_t stride = args->plane_strides[0];
+   if (args->plane_count != 1 || !args->width || !args->height || stride < row ||
+       stride % cpp)
+      return false;
+   return args->plane_offsets[0] + stride * (args->height - 1) + row <= size;
+}
+
+/* Copies the linear image behind res into its texture.  The guest writes it
+ * through venus at any time, so this runs before every draw that samples it.
+ */
+static void
+vrend_resource_refresh_from_memobj(struct vrend_resource *res)
+{
+   const struct vrend_format_table *tex_conv = &tex_conv_table[res->base.format];
+
+   /* the scratch unit, so sampler bindings stay intact */
+   glActiveTexture(GL_TEXTURE0 + vrend_state.max_texture_units - 1);
+   glBindTexture(res->target, res->gl_id);
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, res->memobj_buffer);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH,
+                 res->memobj_stride / util_format_get_blocksize(res->base.format));
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   glTexSubImage2D(res->target, 0, 0, 0, res->base.width0, res->base.height0,
+                   tex_conv->glformat, tex_conv->gltype,
+                   (const void *)(uintptr_t)res->memobj_offset);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   glBindTexture(res->target, 0);
+}
+#endif
+
 static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
                                               int shader_type,
                                               GLuint next_sampler_id)
@@ -5245,6 +5292,11 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
    while (mask) {
       int i = u_bit_scan(&mask);
       struct vrend_sampler_view *tview = shader_view->views[i];
+
+#ifdef WIN32
+      if (tview && tview->texture && tview->texture->memobj_buffer)
+         vrend_resource_refresh_from_memobj(tview->texture);
+#endif
 
       if ((dirty & (1 << i)) && tview) {
          glActiveTexture(GL_TEXTURE0 + next_sampler_id);
@@ -8916,7 +8968,14 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
    }
 
    if (has_bit(res->storage_bits, VREND_STORAGE_GL_MEMOBJ)) {
+#ifdef WIN32
+      if (res->memobj_buffer)
+         glDeleteBuffers(1, &res->memobj_buffer);
+#endif
       glDeleteMemoryObjectsEXT(1, &res->memobj);
+#ifdef WIN32
+      virgl_os_handle_close(res->memobj_handle);
+#endif
    }
 
 #ifdef ENABLE_GBM
@@ -12751,6 +12810,11 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
    if (egl)
       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_UNTYPED_RESOURCE;
 #endif
+#ifdef WIN32
+   /* blobs from other contexts are imported as GL memory objects there */
+   if (has_feature(feat_memory_object) && has_feature(feat_memory_object_win32))
+      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_UNTYPED_RESOURCE;
+#endif
 
    video_memory = vrend_renderer_get_video_memory();
    if (video_memory) {
@@ -13389,15 +13453,21 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
       };
       struct vrend_resource *gr;
 
+#ifdef WIN32
+      /* there is no dma-buf; venus exports device memory as OPAQUE_WIN32 */
+      if (res->fd_type != VIRGL_RESOURCE_FD_OPAQUE)
+         return EINVAL;
+#else
       if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF)
          return EINVAL;
+#endif
 
       gr = vrend_resource_create(&create_args);
       if (!gr)
          return ENOMEM;
 
 #ifdef HAVE_EPOXY_EGL_H
-      if (egl) {
+      if (egl && res->fd_type == VIRGL_RESOURCE_FD_DMABUF) {
 #ifdef ENABLE_GBM
          int plane_fds[VIRGL_GBM_MAX_PLANES];
          uint32_t virgl_format;
@@ -13452,10 +13522,26 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
          int fd = -1;
          GLenum internalformat = tex_conv_table[gr->base.format].internalformat;
 
-         if (!has_feature(feat_memory_object_fd) || !has_feature(feat_memory_object)) {
+#ifdef WIN32
+         const bool can_import =
+            has_feature(feat_memory_object) && has_feature(feat_memory_object_win32);
+#else
+         const bool can_import =
+            has_feature(feat_memory_object) && has_feature(feat_memory_object_fd);
+#endif
+         if (!can_import) {
             FREE(gr);
             return EINVAL;
          }
+#ifdef WIN32
+         if (!vrend_memobj_layout_is_valid(gr->base.format, res->map_size, args)) {
+            virgl_error("%s: bad layout for res %u (%ux%u, stride %u, offset %u)\n", __func__,
+                        res_id, args->width, args->height, args->plane_strides[0],
+                        args->plane_offsets[0]);
+            FREE(gr);
+            return EINVAL;
+         }
+#endif
 
          enum virgl_resource_fd_type fd_type = virgl_resource_export_fd(res, &fd);
          if (fd_type == VIRGL_RESOURCE_FD_INVALID) {
@@ -13466,9 +13552,35 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
          /* Create a GL memory object importing memory from a FD */
          GLuint mem_object;
          glCreateMemoryObjectsEXT(1, &mem_object);
+#ifdef WIN32
+         /* venus exports dma-bufs from non-dedicated memory there (vkr_device_memory.c) */
+         GLint params = GL_FALSE;
+#else
          GLint params = GL_TRUE;
+#endif
          glMemoryObjectParameterivEXT(mem_object, GL_DEDICATED_MEMORY_OBJECT_EXT, &params);
+#ifdef WIN32
+         /* Unlike an fd, an NT handle stays owned by the caller after the
+          * import.  AMD opens it lazily on first use, so it is closed only with
+          * the memory object (vrend_renderer_resource_destroy).
+          */
+         glImportMemoryWin32HandleEXT(mem_object, res->map_size, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT,
+                                      LongToHandle(fd));
+         gr->memobj_handle = fd;
+
+         /* AMD ignores GL_LINEAR_TILING_EXT on imported memory, so the linear
+          * layout is read through a buffer and copied into a texture on the
+          * GPU before draws.
+          */
+         glGenBuffers(1, &gr->memobj_buffer);
+         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gr->memobj_buffer);
+         glBufferStorageMemEXT(GL_PIXEL_UNPACK_BUFFER, res->map_size, mem_object, 0);
+         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+         gr->memobj_stride = args->plane_strides[0];
+         gr->memobj_offset = args->plane_offsets[0];
+#else
          glImportMemoryFdEXT(mem_object, res->map_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
+#endif
 
          struct pipe_resource *pr = &gr->base;
          gr->target = tgsitargettogltarget(pr->target, pr->nr_samples);
@@ -13480,8 +13592,12 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
          glBindTexture(gr->target, gr->gl_id);
          GLsizei width = (GLsizei)args->width;
          GLsizei height = (GLsizei)args->height;
+#ifdef WIN32
+         glTexStorage2D(gr->target, 1, internalformat, width, height);
+#else
          glTexParameteri(gr->target, GL_TEXTURE_TILING_EXT, GL_LINEAR_TILING_EXT);
          glTexStorageMem2DEXT(gr->target, 1, internalformat, width, height, mem_object, 0);
+#endif
          glBindTexture(gr->target, 0);
          gr->is_imported = true;
       }
