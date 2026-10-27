@@ -41,10 +41,28 @@
 #include <asm/ioctl.h>
 typedef unsigned int drm_handle_t;
 
-#else /* One of the BSDs */
+#else /* One of the BSDs, or Windows */
 
 #include <stdint.h>
+#if defined(_WIN32)
+/* Windows has no ioctl(); only the structs and capset ids are used there.
+ * winsock may already define some of these for ioctlsocket().
+ */
+#ifndef _IO
+#define _IO(g, n) 0
+#endif
+#ifndef _IOR
+#define _IOR(g, n, t) 0
+#endif
+#ifndef _IOW
+#define _IOW(g, n, t) 0
+#endif
+#ifndef _IOWR
+#define _IOWR(g, n, t) 0
+#endif
+#else
 #include <sys/ioccom.h>
+#endif
 #include <sys/types.h>
 typedef int8_t   __s8;
 typedef uint8_t  __u8;
